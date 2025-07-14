@@ -1,0 +1,4 @@
+(library
+ (name tools)
+ (public_name ocaml-platform-sdk.tools)
+ (libraries ocaml-platform-sdk))
