@@ -125,7 +125,7 @@ module Merlin : sig
 end
 
 (** {1 OCamlformat Integration} *)
-module OCamlformat : sig
+module Ocamlformat : sig
   val format_doc : t -> path:string -> content:string -> (string, string) result
   (** [format_doc t ~path ~content] formats an OCaml source file. It
       automatically detects whether it is an implementation (.ml) or interface

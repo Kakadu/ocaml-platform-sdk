@@ -35,17 +35,14 @@ module Error = struct
     | Analysis_error msg -> Printf.sprintf "Analysis error: %s" msg
 end
 
-let execute (context : Tool.Context.t) (args : Args.t) =
+let execute ~sw:_ ~env:_ (sdk : Ocaml_platform_sdk.t) (args : Args.t) =
   let src = Logs.Src.create "module-signature" ~doc:"Module signature tool" in
   let module Log = (val Logs.src_log src : Logs.LOG) in
   Log.debug (fun m ->
       m "handle_module_signature called with module_path: %s"
         (String.concat "." args.Args.module_path));
 
-  match
-    Analysis.module_signature context.sdk
-      ~module_path:args.Args.module_path
-  with
+  match Analysis.module_signature sdk ~module_path:args.Args.module_path with
   | Ok signature_text ->
       Ok
         {

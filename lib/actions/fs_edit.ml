@@ -130,7 +130,7 @@ let replace_all_occurrences text old_string new_string =
   in
   replace "" 0
 
-let execute (context : Tool.Context.t) (args : Args.t) =
+let execute ~sw:_ ~env (sdk : Ocaml_platform_sdk.t) (args : Args.t) =
   let {
     Args.file_path;
     old_string;
@@ -140,17 +140,11 @@ let execute (context : Tool.Context.t) (args : Args.t) =
   } =
     args
   in
-
-  (* Resolve relative paths against project root *)
-  let file_path =
-    if Filename.is_relative file_path then
-      Filename.concat context.project_root file_path
-    else file_path
-  in
+  let fs = Eio.Stdenv.fs env in
 
   try
     (* Read current file content *)
-    let content = Eio.Path.load Eio.Path.(context.fs / file_path) in
+    let content = Eio.Path.load Eio.Path.(fs / file_path) in
 
     (* Count occurrences *)
     let occurrences = count_occurrences content old_string in
@@ -215,15 +209,14 @@ let execute (context : Tool.Context.t) (args : Args.t) =
         if is_ocaml_file then
           (* Format with ocamlformat *)
           match
-            OCamlformat.format_doc context.sdk ~path:file_path
-              ~content:new_content
+            Ocamlformat.format_doc sdk ~path:file_path ~content:new_content
           with
           | Ok formatted_content ->
               (* Get diagnostics from Merlin *)
               let diagnostics =
                 match
-                  Merlin.diagnostics context.sdk
-                    ~source_path:file_path ~source_text:formatted_content
+                  Merlin.diagnostics sdk ~source_path:file_path
+                    ~source_text:formatted_content
                 with
                 | Ok reports ->
                     Some
@@ -258,9 +251,7 @@ let execute (context : Tool.Context.t) (args : Args.t) =
       in
 
       (* Write the file *)
-      Eio.Path.save
-        Eio.Path.(context.fs / file_path)
-        final_content ~create:`Never;
+      Eio.Path.save Eio.Path.(fs / file_path) final_content ~create:`Never;
 
       Ok { Output.replacements_made = expected_count; diagnostics; formatted }
   with

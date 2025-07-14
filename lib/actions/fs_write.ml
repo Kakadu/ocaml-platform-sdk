@@ -60,19 +60,13 @@ module Error = struct
     | IO_error msg -> Printf.sprintf "I/O error: %s" msg
 end
 
-let execute (context : Tool.Context.t) (args : Args.t) =
+let execute ~sw:_ ~env (sdk : Ocaml_platform_sdk.t) (args : Args.t) =
   let { Args.file_path; content } = args in
-
-  (* Resolve relative paths against project root *)
-  let file_path =
-    if Filename.is_relative file_path then
-      Filename.concat context.project_root file_path
-    else file_path
-  in
+  let fs = Eio.Stdenv.fs env in
 
   (* Ensure parent directories exist using Eio *)
   let dir = Filename.dirname file_path in
-  (try Eio.Path.mkdirs ~perm:0o755 Eio.Path.(context.fs / dir)
+  (try Eio.Path.mkdirs ~perm:0o755 Eio.Path.(fs / dir)
    with _exn ->
      (* Directory might already exist or we're in a normal case where parent exists *)
      ());
@@ -86,15 +80,12 @@ let execute (context : Tool.Context.t) (args : Args.t) =
   let final_content, formatted, diagnostics =
     if is_ocaml_file then
       (* Format with ocamlformat *)
-      match
-        OCamlformat.format_doc context.sdk ~path:file_path
-          ~content
-      with
+      match Ocamlformat.format_doc sdk ~path:file_path ~content with
       | Ok formatted_content ->
           (* Get diagnostics from Merlin *)
           let diagnostics =
             match
-              Merlin.diagnostics context.sdk ~source_path:file_path
+              Merlin.diagnostics sdk ~source_path:file_path
                 ~source_text:formatted_content
             with
             | Ok reports ->
@@ -131,7 +122,7 @@ let execute (context : Tool.Context.t) (args : Args.t) =
   (* Write the file *)
   try
     Eio.Path.save
-      Eio.Path.(context.fs / file_path)
+      Eio.Path.(fs / file_path)
       final_content ~create:(`Or_truncate 0o644);
     Ok { Output.path = file_path; formatted; diagnostics }
   with

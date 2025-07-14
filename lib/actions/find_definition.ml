@@ -1,7 +1,7 @@
 open Ocaml_platform_sdk
 
-let name = "ocaml_find_references"
-let description = "Find all usages of a symbol"
+let name = "ocaml_find_definition"
+let description = "Find where a symbol is defined"
 
 module Args = struct
   type t = { file_path : string; line : int; column : int } [@@deriving yojson]
@@ -23,16 +23,11 @@ module Args = struct
 end
 
 module Output = struct
-  type reference = {
-    file : string;
-    start_line : int;
-    start_col : int;
-    end_line : int;
-    end_col : int;
-  }
+  type location = { path : string; line : int; column : int }
   [@@deriving yojson]
 
-  type t = { references : reference list; count : int } [@@deriving yojson]
+  type t = { definition : location option; [@default None]message : string }
+  [@@deriving yojson]
 end
 
 module Error = struct
@@ -47,30 +42,29 @@ module Error = struct
     | Merlin_error msg -> Printf.sprintf "Merlin error: %s" msg
 end
 
-let execute (context : Tool.Context.t) (args : Args.t) =
+let execute ~sw:_ ~env (sdk : Ocaml_platform_sdk.t) (args : Args.t) =
   try
-    let source_text =
-      Eio.Path.load Eio.Path.(context.fs / args.Args.file_path)
-    in
+    let fs = Eio.Stdenv.fs env in
+    let source_text = Eio.Path.load Eio.Path.(fs / args.Args.file_path) in
     match
-      Merlin.find_references context.sdk
-        ~source_path:args.Args.file_path ~source_text ~line:args.Args.line
-        ~col:args.Args.column
+      Merlin.find_definition sdk ~source_path:args.Args.file_path ~source_text
+        ~line:args.Args.line ~col:args.Args.column
     with
-    | Ok locs ->
-        let references =
-          List.map
-            (fun (loc, fname) ->
-              {
-                Output.file = fname;
-                start_line = loc.Ocaml_utils.Warnings.loc_start.pos_lnum;
-                start_col = loc.loc_start.pos_cnum - loc.loc_start.pos_bol;
-                end_line = loc.loc_end.pos_lnum;
-                end_col = loc.loc_end.pos_cnum - loc.loc_end.pos_bol;
-              })
-            locs
+    | Ok (path, pos) ->
+        let location =
+          {
+            Output.path;
+            line = pos.pos_lnum;
+            column = pos.pos_cnum - pos.pos_bol;
+          }
         in
-        Ok { Output.references; count = List.length references }
+        Ok
+          {
+            Output.definition = Some location;
+            message =
+              Printf.sprintf "Definition found at: %s:%d:%d" path pos.pos_lnum
+                (pos.pos_cnum - pos.pos_bol);
+          }
     | Error err -> Error (Error.Merlin_error err)
   with
   | Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) ->

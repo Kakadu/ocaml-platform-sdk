@@ -190,19 +190,16 @@ let parse_dune_describe_output output =
     | Error (_, msg) -> Error msg
   with exn -> Error (Printexc.to_string exn)
 
-let execute (context : Tool.Context.t) _args =
-  Log.info (fun m ->
-      m "project-structure tool called with project_root: %s"
-        context.project_root);
+let execute ~sw:_ ~env (_sdk : Ocaml_platform_sdk.t) _args =
+  Log.info (fun m -> m "project-structure tool called");
   Log.debug (fun m -> m "Running dune describe workspace");
 
   (* Run dune describe using Eio.Process *)
   try
     let output_buf = Buffer.create 1024 in
-    let cwd = Eio.Path.(context.fs / context.project_root) in
-    Eio.Process.run context.process_mgr
+    let process_mgr = Eio.Stdenv.process_mgr env in
+    Eio.Process.run process_mgr ~executable:"dune"
       [ "dune"; "describe"; "workspace"; "--format=csexp" ]
-      ~cwd
       ~stdout:(Eio.Flow.buffer_sink output_buf);
 
     let output = Buffer.contents output_buf in

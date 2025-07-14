@@ -1,0 +1,6 @@
+(library
+ (name ocaml_platform_actions)
+ (public_name ocaml-platform-sdk.actions)
+ (libraries ocaml-platform-sdk)
+ (preprocess
+  (pps ppx_deriving_yojson)))

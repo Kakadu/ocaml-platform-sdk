@@ -33,7 +33,7 @@ module Error = struct
     | Build_failed msg -> Printf.sprintf "Build failed: %s" msg
 end
 
-let execute (context : Tool.Context.t) (args : Args.t) =
+let execute ~sw:_ ~env (_sdk : Ocaml_platform_sdk.t) (args : Args.t) =
   let output_lines = ref [] in
   let add_line line = output_lines := line :: !output_lines in
 
@@ -47,11 +47,10 @@ let execute (context : Tool.Context.t) (args : Args.t) =
 
   let build_succeeded =
     try
-      (* Change to project directory for the command *)
-      let cwd = Eio.Path.(context.fs / context.project_root) in
-      Eio.Process.run context.process_mgr
+      (* Run dune build in current directory *)
+      let process_mgr = Eio.Stdenv.process_mgr env in
+      Eio.Process.run process_mgr ~executable:"dune"
         ("dune" :: "build" :: args.Args.targets)
-        ~cwd
         ~stdout:(Eio.Flow.buffer_sink stdout_buf)
         ~stderr:(Eio.Flow.buffer_sink stderr_buf);
       true

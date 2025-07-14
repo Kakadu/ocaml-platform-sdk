@@ -1,9 +1,7 @@
 open Ocaml_platform_sdk
 
-let name = "ocaml_type_at_pos"
-
-let description =
-  "Get type of expression at specific file position in OCaml source files"
+let name = "ocaml_find_references"
+let description = "Find all usages of a symbol"
 
 module Args = struct
   type t = { file_path : string; line : int; column : int } [@@deriving yojson]
@@ -25,7 +23,8 @@ module Args = struct
 end
 
 module Output = struct
-  type location = {
+  type reference = {
+    file : string;
     start_line : int;
     start_col : int;
     end_line : int;
@@ -33,8 +32,7 @@ module Output = struct
   }
   [@@deriving yojson]
 
-  type t = { type_info : string; location : location option [@yojson.option] }
-  [@@deriving yojson]
+  type t = { references : reference list; count : int } [@@deriving yojson]
 end
 
 module Error = struct
@@ -49,26 +47,28 @@ module Error = struct
     | Merlin_error msg -> Printf.sprintf "Merlin error: %s" msg
 end
 
-let execute (context : Tool.Context.t) (args : Args.t) =
+let execute ~sw:_ ~env (sdk : Ocaml_platform_sdk.t) (args : Args.t) =
   try
-    let source_text =
-      Eio.Path.load Eio.Path.(context.fs / args.Args.file_path)
-    in
+    let fs = Eio.Stdenv.fs env in
+    let source_text = Eio.Path.load Eio.Path.(fs / args.Args.file_path) in
     match
-      Merlin.type_at_pos context.sdk ~source_path:args.Args.file_path
-        ~source_text ~line:args.Args.line ~col:args.Args.column
+      Merlin.find_references sdk ~source_path:args.Args.file_path ~source_text
+        ~line:args.Args.line ~col:args.Args.column
     with
-    | Ok (loc, typ) ->
-        let location =
-          Some
-            {
-              Output.start_line = loc.Ocaml_utils.Warnings.loc_start.pos_lnum;
-              start_col = loc.loc_start.pos_cnum - loc.loc_start.pos_bol;
-              end_line = loc.loc_end.pos_lnum;
-              end_col = loc.loc_end.pos_cnum - loc.loc_end.pos_bol;
-            }
+    | Ok locs ->
+        let references =
+          List.map
+            (fun (loc, fname) ->
+              {
+                Output.file = fname;
+                start_line = loc.Ocaml_utils.Warnings.loc_start.pos_lnum;
+                start_col = loc.loc_start.pos_cnum - loc.loc_start.pos_bol;
+                end_line = loc.loc_end.pos_lnum;
+                end_col = loc.loc_end.pos_cnum - loc.loc_end.pos_bol;
+              })
+            locs
         in
-        Ok { Output.type_info = typ; location }
+        Ok { Output.references; count = List.length references }
     | Error err -> Error (Error.Merlin_error err)
   with
   | Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) ->

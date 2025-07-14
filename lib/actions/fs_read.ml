@@ -105,19 +105,13 @@ let apply_line_filter content offset limit =
       in
       String.concat "\n" selected_lines
 
-let execute (context : Tool.Context.t) (args : Args.t) =
+let execute ~sw:_ ~env (sdk : Ocaml_platform_sdk.t) (args : Args.t) =
   let { Args.file_path; offset; limit } = args in
-
-  (* Resolve relative paths against project root *)
-  let file_path =
-    if Filename.is_relative file_path then
-      Filename.concat context.project_root file_path
-    else file_path
-  in
+  let fs = Eio.Stdenv.fs env in
 
   (* Check if file exists and read it *)
   try
-    let full_content = Eio.Path.load Eio.Path.(context.fs / file_path) in
+    let full_content = Eio.Path.load Eio.Path.(fs / file_path) in
 
     (* Apply offset and limit if specified *)
     let content = apply_line_filter full_content offset limit in
@@ -131,8 +125,7 @@ let execute (context : Tool.Context.t) (args : Args.t) =
     if is_ocaml_file then
       (* Get diagnostics from Merlin *)
       match
-        Merlin.diagnostics context.sdk ~source_path:file_path
-          ~source_text:content
+        Merlin.diagnostics sdk ~source_path:file_path ~source_text:content
       with
       | Ok diagnostics ->
           (* Format diagnostics *)

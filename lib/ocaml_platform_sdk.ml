@@ -70,7 +70,7 @@ module Merlin = struct
     Merlin_client.diagnostics t.merlin ~source_path ~source_text
 end
 
-module OCamlformat = struct
+module Ocamlformat = struct
   let format_doc t ~path ~content =
     Ocamlformat_client.format_doc t.ocamlformat ~path ~content
 

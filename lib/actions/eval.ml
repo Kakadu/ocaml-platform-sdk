@@ -15,7 +15,7 @@ module Args = struct
 end
 
 module Output = struct
-  type t = { result : string; stderr : string option [@yojson.option] }
+  type t = { result : string; stderr : string option [@default None]}
   [@@deriving yojson]
 end
 
@@ -29,13 +29,12 @@ module Error = struct
 end
 
 (* Get initialization directives from dune *)
-let get_dune_directives context =
-  let dune_project =
-    Filename.concat context.Tool.Context.project_root "dune-project"
-  in
+let get_dune_directives env =
+  let fs = Eio.Stdenv.fs env in
+  let process_mgr = Eio.Stdenv.process_mgr env in
 
   (* Check if this is a dune project *)
-  match Eio.Path.kind ~follow:true Eio.Path.(context.fs / dune_project) with
+  match Eio.Path.kind ~follow:true Eio.Path.(fs / "dune-project") with
   | `Regular_file | `Directory -> (
       try
         let output_buf = Buffer.create 1024 in
@@ -43,8 +42,8 @@ let get_dune_directives context =
         (* Run dune top with timeout *)
         let output_result =
           try
-            let cwd = Eio.Path.(context.fs / context.project_root) in
-            Eio.Process.run context.process_mgr [ "dune"; "top"; "." ] ~cwd
+            Eio.Process.run process_mgr ~executable:"dune"
+              [ "dune"; "top"; "." ]
               ~stdout:(Eio.Flow.buffer_sink output_buf);
             Ok (Buffer.contents output_buf)
           with exn -> Error (`Process_failed exn)
@@ -66,11 +65,11 @@ let get_dune_directives context =
   | _ -> []
 
 (* Evaluate code using ocaml *)
-let execute (context : Tool.Context.t) (args : Args.t) =
+let execute ~sw:_ ~env (_sdk : Ocaml_platform_sdk.t) (args : Args.t) =
   let code = args.code in
 
   (* Get directives *)
-  let directives = get_dune_directives context in
+  let directives = get_dune_directives env in
 
   (* Ensure code ends with ;; *)
   let code =
@@ -102,8 +101,8 @@ let execute (context : Tool.Context.t) (args : Args.t) =
 
   try
     (* Run ocaml *)
-    let cwd = Eio.Path.(context.fs / context.project_root) in
-    Eio.Process.run context.process_mgr [ "ocaml"; "-noprompt" ] ~cwd
+    let process_mgr = Eio.Stdenv.process_mgr env in
+    Eio.Process.run process_mgr ~executable:"ocaml" [ "ocaml"; "-noprompt" ]
       ~stdin:(Eio.Flow.string_source (Buffer.contents input))
       ~stdout:(Eio.Flow.buffer_sink output_buf)
       ~stderr:(Eio.Flow.buffer_sink error_buf);

@@ -48,42 +48,42 @@ module Error = struct
         "Dune RPC not connected. Please run this command from a dune project."
 end
 
-let execute (context : Tool.Context.t) (_args : Args.t) =
-  match Dune.diagnostics context.sdk ~file:"" with
+let execute ~sw:_ ~env:_ (sdk : Ocaml_platform_sdk.t) (_args : Args.t) =
+  match Dune.diagnostics sdk ~file:"" with
   | Error `Dune_not_initialized -> Error Error.Dune_not_connected
   | Ok diagnostics -> (
-      match Dune.progress context.sdk with
+      match Dune.progress sdk with
       | Error `Dune_not_initialized -> Error Error.Dune_not_connected
       | Ok progress ->
-      let status =
-        match progress with
-        | Dune.Waiting -> "waiting"
-        | Dune.In_progress { complete; remaining; failed } ->
-            Printf.sprintf "building (%d/%d completed, %d failed)" complete
-              (complete + remaining) failed
-        | Dune.Failed -> "failed"
-        | Dune.Interrupted -> "interrupted"
-        | Dune.Success ->
-            if List.length diagnostics = 0 then "success"
-            else "success_with_warnings"
-      in
+          let status =
+            match progress with
+            | Dune.Waiting -> "waiting"
+            | Dune.In_progress { complete; remaining; failed } ->
+                Printf.sprintf "building (%d/%d completed, %d failed)" complete
+                  (complete + remaining) failed
+            | Dune.Failed -> "failed"
+            | Dune.Interrupted -> "interrupted"
+            | Dune.Success ->
+                if List.length diagnostics = 0 then "success"
+                else "success_with_warnings"
+          in
 
-      let formatted_diagnostics =
-        List.map
-          (fun d ->
-            let severity =
-              match d.Dune.severity with
-              | `Error -> "error"
-              | `Warning -> "warning"
-            in
-            {
-              Output.severity;
-              file = d.file;
-              line = d.line;
-              column = d.column;
-              message = d.message;
-            })
-          diagnostics
-      in
+          let formatted_diagnostics =
+            List.map
+              (fun d ->
+                let severity =
+                  match d.Dune.severity with
+                  | `Error -> "error"
+                  | `Warning -> "warning"
+                in
+                {
+                  Output.severity;
+                  file = d.file;
+                  line = d.line;
+                  column = d.column;
+                  message = d.message;
+                })
+              diagnostics
+          in
 
-      Ok { Output.status; diagnostics = formatted_diagnostics })
+          Ok { Output.status; diagnostics = formatted_diagnostics })
