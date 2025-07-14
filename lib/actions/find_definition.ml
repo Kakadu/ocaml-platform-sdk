@@ -26,7 +26,7 @@ module Output = struct
   type location = { path : string; line : int; column : int }
   [@@deriving yojson]
 
-  type t = { definition : location option; [@default None]message : string }
+  type t = { definition : location option; [@default None] message : string }
   [@@deriving yojson]
 end
 

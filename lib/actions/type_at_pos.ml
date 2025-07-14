@@ -33,7 +33,7 @@ module Output = struct
   }
   [@@deriving yojson]
 
-  type t = { type_info : string; location : location option [@default None]}
+  type t = { type_info : string; location : location option [@default None] }
   [@@deriving yojson]
 end
 

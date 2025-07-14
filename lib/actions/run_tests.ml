@@ -24,7 +24,7 @@ module Args = struct
 end
 
 module Output = struct
-  type t = { message : string; test_count : int option [@default None]}
+  type t = { message : string; test_count : int option [@default None] }
   [@@deriving yojson]
 end
 
