@@ -13,6 +13,8 @@
 
 (license ISC)
 
+(implicit_transitive_deps false)
+
 (package
  (name ocaml-platform-sdk)
  (synopsis "Programmatic interface to OCaml Platform tools")
