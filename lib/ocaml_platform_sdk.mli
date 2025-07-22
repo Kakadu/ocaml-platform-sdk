@@ -73,6 +73,85 @@ module Dune : sig
   val progress : t -> (progress, [> `Dune_not_initialized ]) result
   (** [progress t] gets the current build progress from Dune. Returns an error
       if the Dune client was not initialized. *)
+
+  (** {2 Structured Project Information} *)
+
+  (** This module contains types that represent the output of `dune describe`,
+      providing a structured view of the project's libraries, executables, and
+      modules. *)
+  module Describe : sig
+    type uid = string
+    (** A unique identifier for a library, as produced by Dune. This is used to
+        link dependencies. *)
+
+    type module_deps = {
+      for_intf : string list;  (** Modules required by the .mli file. *)
+      for_impl : string list;  (** Modules required by the .ml file. *)
+    }
+    (** Information about a module's dependencies on other modules. *)
+
+    type module_ = {
+      name : string;
+      impl : string option;  (** Path to the .ml file, if it exists. *)
+      intf : string option;  (** Path to the .mli file, if it exists. *)
+      module_deps : module_deps option;
+    }
+    (** A single OCaml module within a library or executable. *)
+
+    type executable = {
+      names : string list;
+      requires : uid list;
+          (** List of library UIDs this executable depends on. *)
+      modules : module_ list;
+    }
+    (** An executable or a group of executables defined in the project. *)
+
+    type library = {
+      name : string;
+      uid : uid;
+      requires : uid list;  (** List of library UIDs this library depends on. *)
+      local : bool;  (** True if the library is part of the local project. *)
+      modules : module_ list;
+    }
+    (** A library defined in the project. *)
+
+    (** An entry in the `dune describe` output. This is a sum type representing
+        the different kinds of stanzas in a project. *)
+    type entry =
+      | Library of library
+      | Executables of executable
+      | Other of Sexplib.Sexp.t
+          (** A catch-all for other or future entry types from `dune describe`,
+              ensuring forward compatibility. *)
+
+    type t = entry list
+    (** The complete, structured output of `dune describe`. *)
+  end
+
+  val describe : t -> (Describe.t, [> `Msg of string ]) result
+  (** [describe t] runs `dune describe` and parses the output into a structured
+      representation. This is the primary input for building a project-level
+      dependency graph or performing other whole-project analyses. *)
+
+  (** {2 Command-Line Interaction} *)
+
+  val run : t -> args:string list -> (string, [> `Msg of string ]) result
+  (** [run t ~args] executes a `dune` command with the given arguments in the
+      project root and returns its standard output. Example: `Dune.run t
+      ~args:["build"; "@install"]` *)
+
+  (** {2 Build Artifacts} *)
+
+  val find_cm_file :
+    t ->
+    module_path:string list ->
+    extension:string ->
+    (string option, [> `Msg of string ]) result
+  (** [find_cm_file t ~module_path ~extension] finds a compiled module file
+      (e.g., .cmi, .cmt) in the project's `_build` directory.
+
+      @param module_path A path like `["My_lib"; "Utils"]`.
+      @param extension The file extension, e.g., `".cmi"`. *)
 end
 
 (** {1 Merlin Integration} *)

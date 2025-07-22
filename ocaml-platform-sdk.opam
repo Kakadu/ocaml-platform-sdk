@@ -20,6 +20,10 @@ depends: [
   "ppx_deriving_yojson"
   "csexp"
   "logs"
+  "parsexp"
+  "sexplib"
+  "ppx_sexp_conv"
+  "ppx_deriving"
   "odoc" {with-doc}
 ]
 build: [

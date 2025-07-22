@@ -30,6 +30,10 @@
   yojson
   ppx_deriving_yojson
   csexp
-  logs)
+  logs
+  parsexp
+  sexplib
+  ppx_sexp_conv
+  ppx_deriving)
  (tags
   (ocaml-platform sdk tools dune merlin ocamlformat)))

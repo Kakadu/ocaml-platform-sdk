@@ -16,6 +16,8 @@
   merlin-lib.query_commands
   merlin-lib.analysis
   compiler-libs.common
-  ocamlformat-lib)
+  ocamlformat-lib
+  parsexp
+  sexplib)
  (preprocess
-  (pps ppx_deriving_yojson)))
+  (pps ppx_deriving_yojson ppx_deriving.eq ppx_deriving.ord ppx_sexp_conv)))
