@@ -2,9 +2,6 @@
 
 open Eio
 
-(* Import Dune RPC types *)
-module Drpc = Dune_rpc.V1
-
 (* Setup logging *)
 let src = Logs.Src.create "dune-rpc-client" ~doc:"Dune RPC Client logging"
 
@@ -129,7 +126,9 @@ type progress =
 type session = {
   flow : Eio.Flow.two_way_ty Eio.Resource.t;
   buf_read : Buf_read.t;
-  id : Drpc.Id.t; [@warning "-69"]
+  (* Session identifier. Kept as a plain string so the client does not depend
+     on a specific dune-rpc [Id] API (which moved/changed between versions). *)
+  id : string;
   request_id : Request_id.t;
 }
 
@@ -223,7 +222,7 @@ let read_csexp buf_read =
 
 (* Initialize RPC session *)
 let initialize_session ~flow ~buf_read =
-  let id = Drpc.Id.make (Csexp.Atom "ocaml-mcp") in
+  let id = "ocaml-mcp" in
   let request_id = Request_id.create () in
 
   (* Send initialize request *)
