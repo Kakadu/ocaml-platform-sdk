@@ -1,4 +1,14 @@
-(** Dune RPC client with registry polling using Eio *)
+(** Dune RPC client speaking the dune 3.20 csexp RPC protocol, using Eio.
+
+    The protocol is a two-step handshake followed by long-polling:
+
+    1. [initialize]    -- establish the session
+    2. [version_menu]  -- negotiate the version of each method
+    3. long-poll [poll/progress] and [poll/diagnostic] to observe the build
+
+    Every message is a csexp "packet": a record with optional fields
+    [id], [result], [method] and [params]. A request carries [id]/[method]/[params],
+    a response carries [id]/[result], a notification carries [method]/[params]. *)
 
 open Eio
 
@@ -7,7 +17,7 @@ let src = Logs.Src.create "dune-rpc-client" ~doc:"Dune RPC Client logging"
 
 module Log = (val Logs.src_log src : Logs.LOG)
 
-(* Request ID counter *)
+(* Request ID counter for the handshake requests. *)
 module Request_id = struct
   type t = { mutable counter : int; mutex : Eio.Mutex.t }
 
@@ -144,6 +154,11 @@ type t = {
   mutex : Eio.Mutex.t;
   env : Eio_unix.Stdenv.base;
   mutable last_poll_error : string option;
+  (* Long-poll request ids and the poller (subscription) ids. These are only
+     ever touched by the single [run] fiber, so they need no locking. *)
+  mutable progress_rid : Csexp.t;
+  mutable diagnostic_rid : Csexp.t;
+  mutable next_poll_id : int;
 }
 
 let default_registry_path () =
@@ -168,6 +183,9 @@ let create ~sw ~env ~root =
     mutex;
     env;
     last_poll_error = None;
+    progress_rid = Csexp.Atom "poll-progress-0";
+    diagnostic_rid = Csexp.Atom "poll-diagnostic-0";
+    next_poll_id = 0;
   }
 
 (* Find matching Dune instance for our root *)
@@ -192,7 +210,9 @@ let write_csexp buf_write csexp =
   let s = Csexp.to_string csexp in
   Buf_write.string buf_write s
 
-(* Read a Csexp from the buffer using the Parser module for robust parsing *)
+(* Read a Csexp from the buffer using the Parser module for robust parsing.
+   Blocks (yields) until a complete sexp is available; returns an error only
+   when the connection is closed. *)
 let read_csexp buf_read =
   let module Lexer = Csexp.Parser.Lexer in
   let module Stack = Csexp.Parser.Stack in
@@ -220,40 +240,116 @@ let read_csexp buf_read =
   | End_of_file -> Error "Connection closed"
   | exn -> Error (Printf.sprintf "Parse error: %s" (Printexc.to_string exn))
 
-(* Initialize RPC session *)
+(* ---------------------------------------------------------------------------
+   Protocol helpers
+   ------------------------------------------------------------------------- *)
+
+(* Compare two csexp values for equality via their canonical string form. The
+   csexp library does not expose an [equal] function. *)
+let same_csexp a b = Csexp.to_string a = Csexp.to_string b
+
+(* Allocate a fresh long-poll request id. Only called from the [run] fiber. *)
+let alloc_poll_id t prefix =
+  let n = t.next_poll_id in
+  t.next_poll_id <- n + 1;
+  Csexp.Atom (Printf.sprintf "%s-%d" prefix n)
+
+(* Stable poller (subscription) ids, sent as the params of poll requests. *)
+let progress_poller_id = Csexp.Atom "ocaml-mcp-progress"
+let diagnostic_poller_id = Csexp.Atom "ocaml-mcp-diagnostic"
+
+(* Send a request packet: ((id ID) (method M) (params P)). *)
+let send_request session id method_ params =
+  let packet =
+    Csexp.List
+      [
+        Csexp.List [ Csexp.Atom "id"; id ];
+        Csexp.List [ Csexp.Atom "method"; Csexp.Atom method_ ];
+        Csexp.List [ Csexp.Atom "params"; params ];
+      ]
+  in
+  Buf_write.with_flow session.flow (fun w ->
+      write_csexp w packet;
+      Buf_write.flush w)
+
+(* The methods and versions this client advertises during version negotiation.
+   The server replies with the greatest common version for each method. *)
+let supported_menu =
+  Csexp.List
+    [
+      Csexp.List
+        [ Csexp.Atom "poll/progress"; Csexp.List [ Csexp.Atom "1"; Csexp.Atom "2" ] ];
+      Csexp.List
+        [ Csexp.Atom "poll/diagnostic"; Csexp.List [ Csexp.Atom "1"; Csexp.Atom "2" ] ];
+      Csexp.List
+        [ Csexp.Atom "diagnostics"; Csexp.List [ Csexp.Atom "1"; Csexp.Atom "2" ] ];
+      Csexp.List [ Csexp.Atom "ping"; Csexp.List [ Csexp.Atom "1" ] ];
+      Csexp.List [ Csexp.Atom "build_dir"; Csexp.List [ Csexp.Atom "1" ] ];
+      Csexp.List
+        [ Csexp.Atom "cancel-poll/progress"; Csexp.List [ Csexp.Atom "1" ] ];
+      Csexp.List
+        [ Csexp.Atom "cancel-poll/diagnostic"; Csexp.List [ Csexp.Atom "1" ] ];
+      Csexp.List [ Csexp.Atom "shutdown"; Csexp.List [ Csexp.Atom "1" ] ];
+    ]
+
+(* Perform the two-step handshake: [initialize] then [version_menu]. On success
+   returns a ready-to-use session. *)
 let initialize_session ~flow ~buf_read =
   let id = "ocaml-mcp" in
   let request_id = Request_id.create () in
+  let session_id = Csexp.Atom "ocaml-mcp" in
 
-  (* Send initialize request *)
-  let req_id = Request_id.next request_id in
-  let csexp =
+  (* Step 1: initialize *)
+  let init_params =
     Csexp.List
       [
-        Csexp.Atom "request";
-        Csexp.List [ Csexp.Atom "id"; Csexp.Atom req_id ];
-        Csexp.Atom "initialize";
-        Csexp.List [ Csexp.Atom "version"; Csexp.Atom "1.0" ];
+        Csexp.List
+          [
+            Csexp.Atom "dune_version";
+            Csexp.List [ Csexp.Atom "3"; Csexp.Atom "20" ];
+          ];
+        Csexp.List [ Csexp.Atom "protocol_version"; Csexp.Atom "0" ];
+        Csexp.List [ Csexp.Atom "id"; session_id ];
+      ]
+  in
+  let init_packet =
+    Csexp.List
+      [
+        Csexp.List [ Csexp.Atom "id"; Csexp.Atom "initialize" ];
+        Csexp.List [ Csexp.Atom "method"; Csexp.Atom "initialize" ];
+        Csexp.List [ Csexp.Atom "params"; init_params ];
       ]
   in
   Buf_write.with_flow flow (fun w ->
-      write_csexp w csexp;
+      write_csexp w init_packet;
       Buf_write.flush w);
 
-  (* Read response *)
+  (* Read the initialize response, then send the version negotiation. *)
   match read_csexp buf_read with
-  | Ok (Csexp.List [ Csexp.Atom "response"; _; Csexp.Atom "ok"; _ ]) ->
-      Ok { flow; buf_read; id; request_id }
-  | Ok (Csexp.List [ Csexp.Atom "response"; _; Csexp.Atom "error"; msg ]) ->
-      let error_msg =
-        match msg with
-        | Csexp.Atom s -> s
-        | Csexp.List _ -> "Complex error response"
+  | Ok (Csexp.List [ _; Csexp.List [ Csexp.Atom "result"; Csexp.List [ Csexp.Atom "ok"; _ ] ] ])
+    ->
+      let vn_packet =
+        Csexp.List
+          [
+            Csexp.List [ Csexp.Atom "id"; Csexp.Atom "version-menu" ];
+            Csexp.List [ Csexp.Atom "method"; Csexp.Atom "version_menu" ];
+            Csexp.List [ Csexp.Atom "params"; supported_menu ];
+          ]
       in
-      Error (Printf.sprintf "Initialize failed: %s" error_msg)
+      Buf_write.with_flow flow (fun w ->
+          write_csexp w vn_packet;
+          Buf_write.flush w);
+      match read_csexp buf_read with
+      | Ok (Csexp.List [ _; Csexp.List [ Csexp.Atom "result"; Csexp.List [ Csexp.Atom "ok"; _ ] ] ])
+        -> Ok { flow; buf_read; id; request_id }
+      | Ok sexp ->
+          Error
+            (Printf.sprintf "Invalid version_menu response: %s" (Csexp.to_string sexp))
+      | Error msg -> Error msg
+  | Ok (Csexp.List [ _; Csexp.List [ Csexp.Atom "result"; Csexp.List [ Csexp.Atom "error"; err ] ] ])
+    -> Error (Printf.sprintf "Initialize failed: %s" (Csexp.to_string err))
   | Ok sexp ->
-      Error
-        (Printf.sprintf "Invalid initialize response: %s" (Csexp.to_string sexp))
+      Error (Printf.sprintf "Invalid initialize response: %s" (Csexp.to_string sexp))
   | Error msg -> Error msg
 
 (* Connect to a Dune instance *)
@@ -277,42 +373,73 @@ let connect_to_instance ~sw ~net instance =
             (Printf.sprintf "Connection failed: %s" (Printexc.to_string exn))
       | exn -> Error (Printexc.to_string exn))
 
-(* Subscribe to diagnostics and progress *)
-let subscribe_to_events session _t =
-  (* Subscribe to diagnostics *)
-  let diag_req_id = Request_id.next session.request_id in
-  let diag_msg =
-    Csexp.List
-      [
-        Csexp.Atom "request";
-        Csexp.List [ Csexp.Atom "id"; Csexp.Atom diag_req_id ];
-        Csexp.Atom "subscribe";
-        Csexp.Atom "diagnostics";
-      ]
-  in
-  Buf_write.with_flow session.flow (fun w ->
-      write_csexp w diag_msg;
-      Buf_write.flush w);
+(* Kick off the long-polls for progress and diagnostics. The first poll of each
+   returns the current state immediately; subsequent polls block until a change. *)
+let subscribe_to_events t session =
+  t.progress_rid <- alloc_poll_id t "poll-progress";
+  t.diagnostic_rid <- alloc_poll_id t "poll-diagnostic";
+  send_request session t.progress_rid "poll/progress" progress_poller_id;
+  send_request session t.diagnostic_rid "poll/diagnostic" diagnostic_poller_id
 
-  (* Subscribe to progress *)
-  let progress_req_id = Request_id.next session.request_id in
-  let progress_msg =
-    Csexp.List
-      [
-        Csexp.Atom "request";
-        Csexp.List [ Csexp.Atom "id"; Csexp.Atom progress_req_id ];
-        Csexp.Atom "subscribe";
-        Csexp.Atom "progress";
-      ]
-  in
-  Buf_write.with_flow session.flow (fun w ->
-      write_csexp w progress_msg;
-      Buf_write.flush w)
+(* ---------------------------------------------------------------------------
+   Response decoding
+   ------------------------------------------------------------------------- *)
 
-(* Parse diagnostic from Csexp - based on Dune RPC protocol *)
+(* Extract human-readable text from a dune Pp (pretty-printer) sexp. The Pp is a
+   recursive AST; we walk it collecting the visible text. *)
+let extract_pp_text =
+  let rec aux = function
+    (* dune encodes each Pp constructor as [(Name <arg-sexp>)]. A [pair a b]
+       argument is itself a nested list [(a b)], so compound constructors carry
+       their arguments inside one extra list level. See dune's
+       [exported_types.Pp.sexp]. *)
+    | Csexp.List [ Csexp.Atom "Nop"; _ ] -> ""
+    | Csexp.List [ Csexp.Atom "Newline"; _ ] -> "\n"
+    | Csexp.List [ Csexp.Atom "Verbatim"; Csexp.Atom s ] -> s
+    | Csexp.List [ Csexp.Atom "Text"; Csexp.Atom s ] -> s
+    | Csexp.List [ Csexp.Atom "Char"; Csexp.Atom c ] -> c
+    | Csexp.List [ Csexp.Atom "Seq"; Csexp.List [ a; b ] ] -> aux a ^ aux b
+    | Csexp.List [ Csexp.Atom "Concat"; Csexp.List [ a; Csexp.List bs ] ] ->
+        aux a ^ String.concat "" (List.map aux bs)
+    | Csexp.List [ Csexp.Atom "Box"; Csexp.List [ _; a ] ] -> aux a
+    | Csexp.List [ Csexp.Atom "Vbox"; Csexp.List [ _; a ] ] -> aux a
+    | Csexp.List [ Csexp.Atom "Hbox"; a ] -> aux a
+    | Csexp.List [ Csexp.Atom "Hvbox"; Csexp.List [ _; a ] ] -> aux a
+    | Csexp.List [ Csexp.Atom "Hovbox"; Csexp.List [ _; a ] ] -> aux a
+    | Csexp.List [ Csexp.Atom "Tag"; Csexp.List [ _; a ] ] -> aux a
+    | Csexp.List [ Csexp.Atom "Break"; _ ] -> " "
+    | Csexp.Atom s -> s (* fallback: a bare atom is treated as plain text *)
+    | _ -> ""
+  in
+  aux
+
+(* Parse a dune Progress sexp (v1 or v2). *)
+let parse_progress = function
+  | Csexp.Atom "waiting" | Csexp.List [ Csexp.Atom "waiting"; _ ] -> Waiting
+  | Csexp.Atom "failed" | Csexp.List [ Csexp.Atom "failed"; _ ] -> Failed
+  | Csexp.Atom "interrupted" | Csexp.List [ Csexp.Atom "interrupted"; _ ] -> Interrupted
+  | Csexp.Atom "success" | Csexp.List [ Csexp.Atom "success"; _ ] -> Success
+  | Csexp.List [ Csexp.Atom "in_progress"; Csexp.List fields ] ->
+      let find_int name fields =
+        let rec find = function
+          | [] -> None
+          | Csexp.List [ Csexp.Atom n; Csexp.Atom v ] :: _ when n = name -> (
+              try Some (int_of_string v) with
+              | Failure _ | Invalid_argument _ -> None)
+          | _ :: rest -> find rest
+        in
+        find fields
+      in
+      let complete = find_int "complete" fields |> Option.value ~default:0 in
+      let remaining = find_int "remaining" fields |> Option.value ~default:0 in
+      let failed = find_int "failed" fields |> Option.value ~default:0 in
+      In_progress { complete; remaining; failed }
+  | _ -> Waiting
+
+(* Parse a dune Diagnostic sexp (v1 or v2) into our simplified diagnostic. *)
 let parse_diagnostic csexp =
   let open Csexp in
-  (* Helper to find a field in an association list *)
+  (* Helper to find a field in an association list of (name value) pairs. *)
   let find_field name fields =
     let rec find = function
       | [] -> None
@@ -322,163 +449,140 @@ let parse_diagnostic csexp =
     find fields
   in
 
-  (* Parse severity *)
   let parse_severity = function
     | Atom "error" -> Some `Error
     | Atom "warning" -> Some `Warning
     | _ -> None
   in
 
-  (* Parse location *)
+  let parse_pos pos_fields =
+    let fname = find_field "pos_fname" pos_fields in
+    let lnum = find_field "pos_lnum" pos_fields in
+    let cnum = find_field "pos_cnum" pos_fields in
+    let bol = find_field "pos_bol" pos_fields in
+    match (fname, lnum, cnum, bol) with
+    | Some (Atom file), Some (Atom line_str), Some (Atom cnum_str), Some (Atom bol_str)
+      -> (
+        try
+          let line = int_of_string line_str in
+          let cnum = int_of_string cnum_str in
+          let bol = int_of_string bol_str in
+          Some (file, line, cnum - bol)
+        with _ -> None)
+    | _ -> None
+  in
+
   let parse_loc = function
     | List fields -> (
-        let start_pos = find_field "start" fields in
-        match start_pos with
-        | Some (List pos_fields) -> (
-            let fname = find_field "pos_fname" pos_fields in
-            let lnum = find_field "pos_lnum" pos_fields in
-            let cnum = find_field "pos_cnum" pos_fields in
-            let bol = find_field "pos_bol" pos_fields in
-            match (fname, lnum, cnum, bol) with
-            | ( Some (Atom file),
-                Some (Atom line_str),
-                Some (Atom cnum_str),
-                Some (Atom bol_str) ) -> (
-                try
-                  let line = int_of_string line_str in
-                  let cnum = int_of_string cnum_str in
-                  let bol = int_of_string bol_str in
-                  Some (file, line, cnum - bol)
-                with _ -> None)
-            | _ -> None)
+        match find_field "start" fields with
+        | Some (List pos_fields) -> parse_pos pos_fields
         | _ -> None)
     | _ -> None
   in
 
-  (* Parse the diagnostic *)
   match csexp with
   | List fields -> (
       let message = find_field "message" fields in
-      let severity =
-        Option.bind (find_field "severity" fields) parse_severity
-      in
+      let severity = Option.bind (find_field "severity" fields) parse_severity in
       let loc = Option.bind (find_field "loc" fields) parse_loc in
       match (message, loc) with
-      | Some (Atom msg), Some (file, line, column) ->
+      | Some msg_sexp, Some (file, line, column) ->
           Some
             {
               file;
               line;
               column;
-              message = msg;
+              message = extract_pp_text msg_sexp;
               severity = Option.value severity ~default:`Warning;
             }
       | _ -> None)
   | _ -> None
 
-(* Process incoming messages *)
+(* Apply a single diagnostic event (Add/Remove) to the diagnostics table. *)
+let apply_diagnostic_event t = function
+  | Csexp.List [ Csexp.Atom "Add"; diag_sexp ] -> (
+      match parse_diagnostic diag_sexp with
+      | Some diag ->
+          Eio.Mutex.use_rw ~protect:true t.mutex (fun () ->
+              let current =
+                Hashtbl.find_opt t.diagnostics diag.file |> Option.value ~default:[]
+              in
+              let is_dup =
+                List.exists
+                  (fun d ->
+                    d.line = diag.line && d.column = diag.column
+                    && d.message = diag.message)
+                  current
+              in
+              if not is_dup then
+                Hashtbl.replace t.diagnostics diag.file (diag :: current))
+      | None -> ())
+  | Csexp.List [ Csexp.Atom "Remove"; diag_sexp ] -> (
+      match parse_diagnostic diag_sexp with
+      | Some diag ->
+          Eio.Mutex.use_rw ~protect:true t.mutex (fun () ->
+              let current =
+                Hashtbl.find_opt t.diagnostics diag.file |> Option.value ~default:[]
+              in
+              let filtered =
+                List.filter
+                  (fun d -> not (d.line = diag.line && d.column = diag.column))
+                  current
+              in
+              if filtered = [] then Hashtbl.remove t.diagnostics diag.file
+              else Hashtbl.replace t.diagnostics diag.file filtered)
+      | None -> ())
+  | _ -> ()
+
+(* Handle the data payload of a poll/progress response: (Some <progress>) or None. *)
+let handle_progress_data t = function
+  | Csexp.List [ Csexp.Atom "Some"; progress_sexp ] ->
+      let progress = parse_progress progress_sexp in
+      Eio.Mutex.use_rw ~protect:true t.mutex (fun () -> t.progress <- progress)
+  | _ -> ()
+
+(* Handle the data payload of a poll/diagnostic response: (Some [<event>...]) or None. *)
+let handle_diagnostic_data t data =
+  match data with
+  | Csexp.List [ Csexp.Atom "Some"; Csexp.List events ] ->
+      List.iter (apply_diagnostic_event t) events
+  | _ -> ()
+
+(* Process one incoming packet. Returns false if the connection is closed.
+   When a poll response arrives, the corresponding poll is re-issued so that we
+   always have exactly one outstanding progress poll and one diagnostic poll. *)
 let process_messages t session =
   try
     match read_csexp session.buf_read with
     | Error _ -> false (* Connection closed *)
     | Ok csexp ->
-        (* Parse different message types *)
         (match csexp with
         | Csexp.List
-            [ Csexp.Atom "notification"; Csexp.Atom "diagnostic"; payload ] -> (
-            (* Single diagnostic event *)
-            match payload with
-            | Csexp.List [ Csexp.Atom "Add"; diag_sexp ] -> (
-                match parse_diagnostic diag_sexp with
-                | Some diag ->
-                    Eio.Mutex.use_rw ~protect:true t.mutex (fun () ->
-                        let current =
-                          Hashtbl.find_opt t.diagnostics diag.file
-                          |> Option.value ~default:[]
-                        in
-                        Hashtbl.replace t.diagnostics diag.file (diag :: current))
-                | None -> ())
-            | Csexp.List [ Csexp.Atom "Remove"; diag_sexp ] -> (
-                (* For remove, we need at least the file to clear diagnostics *)
-                match parse_diagnostic diag_sexp with
-                | Some diag ->
-                    Eio.Mutex.use_rw ~protect:true t.mutex (fun () ->
-                        (* Remove this specific diagnostic or clear file *)
-                        let current =
-                          Hashtbl.find_opt t.diagnostics diag.file
-                          |> Option.value ~default:[]
-                        in
-                        let filtered =
-                          List.filter
-                            (fun d ->
-                              not (d.line = diag.line && d.column = diag.column))
-                            current
-                        in
-                        if filtered = [] then
-                          Hashtbl.remove t.diagnostics diag.file
-                        else Hashtbl.replace t.diagnostics diag.file filtered)
-                | None -> ())
-            | _ -> ())
-        | Csexp.List
             [
-              Csexp.Atom "notification";
-              Csexp.Atom "diagnostics";
-              Csexp.List events;
-            ] ->
-            (* Multiple diagnostic events *)
-            List.iter
-              (function
-                | Csexp.List [ Csexp.Atom "Add"; diag_sexp ] -> (
-                    match parse_diagnostic diag_sexp with
-                    | Some diag ->
-                        Eio.Mutex.use_rw ~protect:true t.mutex (fun () ->
-                            let current =
-                              Hashtbl.find_opt t.diagnostics diag.file
-                              |> Option.value ~default:[]
-                            in
-                            Hashtbl.replace t.diagnostics diag.file
-                              (diag :: current))
-                    | None -> ())
-                | Csexp.List [ Csexp.Atom "Remove"; diag_sexp ] -> (
-                    match parse_diagnostic diag_sexp with
-                    | Some diag ->
-                        Eio.Mutex.use_rw ~protect:true t.mutex (fun () ->
-                            Hashtbl.remove t.diagnostics diag.file)
-                    | None -> ())
-                | _ -> ())
-              events
-        | Csexp.List
-            [ Csexp.Atom "notification"; Csexp.Atom "progress"; progress_csexp ]
-          -> (
-            (* Handle progress update *)
-            match progress_csexp with
-            | Csexp.Atom "Waiting" -> t.progress <- Waiting
-            | Csexp.Atom "Failed" -> t.progress <- Failed
-            | Csexp.Atom "Interrupted" -> t.progress <- Interrupted
-            | Csexp.Atom "Success" -> t.progress <- Success
-            | Csexp.List [ Csexp.Atom "In_progress"; Csexp.List fields ] ->
-                let find_int name fields =
-                  let rec find = function
-                    | [] -> None
-                    | Csexp.List [ Csexp.Atom n; Csexp.Atom v ] :: _
-                      when n = name -> (
-                        try Some (int_of_string v)
-                        with Failure _ | Invalid_argument _ -> None)
-                    | _ :: rest -> find rest
-                  in
-                  find fields
-                in
-                let complete =
-                  find_int "complete" fields |> Option.value ~default:0
-                in
-                let remaining =
-                  find_int "remaining" fields |> Option.value ~default:0
-                in
-                let failed =
-                  find_int "failed" fields |> Option.value ~default:0
-                in
-                t.progress <- In_progress { complete; remaining; failed }
-            | _ -> ())
+              Csexp.List [ Csexp.Atom "id"; rid ];
+              Csexp.List [ Csexp.Atom "result"; result ];
+            ] -> (
+            let is_progress = same_csexp rid t.progress_rid in
+            let is_diagnostic = same_csexp rid t.diagnostic_rid in
+            (match result with
+            | Csexp.List [ Csexp.Atom "ok"; data ] ->
+                if is_progress then handle_progress_data t data
+                else if is_diagnostic then handle_diagnostic_data t data
+                else ()
+            | Csexp.List [ Csexp.Atom "error"; err ] ->
+                Log.debug (fun m -> m "RPC error: %s" (Csexp.to_string err))
+            | _ -> ());
+            (* Re-issue the corresponding poll so we always keep exactly one
+               outstanding progress poll and one diagnostic poll. Re-issuing on
+               error too means a transient failure cannot silently drop a
+               subscription. *)
+            if is_progress then (
+              t.progress_rid <- alloc_poll_id t "poll-progress";
+              send_request session t.progress_rid "poll/progress" progress_poller_id)
+            else if is_diagnostic then (
+              t.diagnostic_rid <- alloc_poll_id t "poll-diagnostic";
+              send_request session t.diagnostic_rid "poll/diagnostic"
+                diagnostic_poller_id))
         | _ -> ());
         true
   with
@@ -489,33 +593,53 @@ let process_messages t session =
           m "Unexpected error in process_messages: %s" (Printexc.to_string exn));
       true
 
-(* Poll for Dune instances and connect if found *)
+(* Attempt to connect to [instance]. On success, subscribe to events and mark
+   the client Connected. Returns true iff a connection was established. *)
+let try_connect_instance t ~net (instance : Registry_poll.instance) =
+  match connect_to_instance ~sw:t.sw ~net instance with
+  | Ok session ->
+      subscribe_to_events t session;
+      t.state <- Connected session;
+      true
+  | Error _msg ->
+      (* Ignore connection errors for resilience *)
+      false
+
+(* Dune exposes its RPC server as a single unix socket at
+   <root>/_build/.rpc/dune, without writing a registry entry. Build an
+   [instance] pointing at that well-known path so we can probe it directly
+   when the registry-based discovery finds no matching instance. *)
+let direct_socket_instance (t : t) : Registry_poll.instance =
+  { root = t.root;
+    pid = None;
+    socket = Some (t.root ^ "/_build/.rpc/dune"); }
+
+(* Poll for Dune instances and connect if found. Falls back to dune's
+   well-known in-build-dir RPC socket when the registry has no match. *)
 let poll_and_connect t =
   Eio.Mutex.use_rw ~protect:true t.mutex (fun () ->
       match t.state with
       | Connected _ | Closed -> ()
-      | Disconnected -> (
-          match t.registry_path with
-          | None -> ()
-          | Some registry_path -> (
-              let fs = Eio.Stdenv.fs t.env in
-              let net = Eio.Stdenv.net t.env in
-              match Registry_poll.poll ~fs registry_path with
-              | Error msg ->
-                  if t.last_poll_error <> Some msg then
-                    t.last_poll_error <- Some msg (* Log error if needed *)
-              | Ok instances -> (
-                  t.last_poll_error <- None;
-                  match find_matching_instance instances t.root with
-                  | None -> ()
-                  | Some instance -> (
-                      match connect_to_instance ~sw:t.sw ~net instance with
-                      | Ok session ->
-                          subscribe_to_events session t;
-                          t.state <- Connected session
-                      | Error _msg ->
-                          (* Ignore connection errors for resilience *)
-                          ())))))
+      | Disconnected ->
+          let net = Eio.Stdenv.net t.env in
+          let connected_via_registry =
+            match t.registry_path with
+            | None -> false
+            | Some registry_path -> (
+                let fs = Eio.Stdenv.fs t.env in
+                match Registry_poll.poll ~fs registry_path with
+                | Error msg ->
+                    if t.last_poll_error <> Some msg then
+                      t.last_poll_error <- Some msg (* Log error if needed *) ;
+                    false
+                | Ok instances -> (
+                    t.last_poll_error <- None;
+                    match find_matching_instance instances t.root with
+                    | None -> false
+                    | Some instance -> try_connect_instance t ~net instance))
+          in
+          if not connected_via_registry then
+            ignore (try_connect_instance t ~net (direct_socket_instance t)))
 
 (* Main polling loop *)
 let run t =
@@ -523,7 +647,8 @@ let run t =
   let rec loop () =
     poll_and_connect t;
 
-    (* Process messages if connected *)
+    (* Process messages if connected. With long-polling this blocks until the
+       next progress/diagnostic change, so the loop self-paces. *)
     (match t.state with
     | Connected session ->
         if not (process_messages t session) then
@@ -533,7 +658,8 @@ let run t =
               t.state <- Disconnected)
     | _ -> ());
 
-    (* Sleep for 250ms before next poll *)
+    (* Sleep before the next iteration. When connected this is a small extra
+       delay after each update; when disconnected it paces reconnection. *)
     Eio.Time.sleep clock 0.25;
 
     match t.state with Closed -> () | _ -> loop ()
